@@ -79,6 +79,20 @@ final class BridgeInstaller {
         return $this->bridgePath;
     }
 
+    public static function removeManagedBridge( $bridgePath ) {
+        $bridgePath = (string) $bridgePath;
+        if ( ! is_file( $bridgePath ) || is_link( $bridgePath ) ) {
+            return false;
+        }
+
+        $contents = @file_get_contents( $bridgePath );
+        if ( false === $contents || false === strpos( $contents, self::MARKER ) ) {
+            return false;
+        }
+
+        return @unlink( $bridgePath );
+    }
+
     private function escapeSingleQuoted( $value ) {
         return str_replace( array( '\\', "'" ), array( '\\\\', "\\'" ), (string) $value );
     }

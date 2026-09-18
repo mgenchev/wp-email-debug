@@ -36,7 +36,9 @@ final class EmailLogWriter {
         $subject = isset( $email['subject'] ) ? (string) $email['subject'] : '';
         $status = isset( $email['status'] ) ? (string) $email['status'] : 'successful';
         $statusToken = $this->statusToken( $status );
-        $base = $this->formatTimestamp( $timestamp ) . '_' . $statusToken . '_' . $this->slugify( '' !== trim( $subject ) ? $subject : 'no-subject' );
+        $typeToken = $this->typeToken( isset( $email['log_type'] ) ? $email['log_type'] : '' );
+        $nameToken = '' !== $typeToken ? $typeToken . '-' . $statusToken : $statusToken;
+        $base = $this->formatTimestamp( $timestamp ) . '_' . $nameToken . '_' . $this->slugify( '' !== trim( $subject ) ? $subject : 'no-subject' );
         $path = $this->uniquePath( $base );
         $content = $this->formatLog( $email, $timestamp );
 
@@ -66,9 +68,21 @@ final class EmailLogWriter {
         return 'SUCCESSFUL';
     }
 
+    private function typeToken( $type ) {
+        $type = strtolower( trim( (string) $type ) );
+        if ( 'test' === $type ) {
+            return 'TEST';
+        }
+        if ( 'check' === $type ) {
+            return 'CHECK';
+        }
+        return '';
+    }
+
     private function formatLog( array $email, $timestamp ) {
         $lines = array();
-        $lines[] = 'WP EMAIL DEBUG';
+        $typeToken = $this->typeToken( isset( $email['log_type'] ) ? $email['log_type'] : '' );
+        $lines[] = '' !== $typeToken ? 'WP EMAIL DEBUG - ' . $typeToken : 'WP EMAIL DEBUG';
         $lines[] = str_repeat( '-', 68 );
         $lines[] = '';
         $status = isset( $email['status'] ) ? (string) $email['status'] : 'successful';
@@ -91,23 +105,29 @@ final class EmailLogWriter {
                 $lines[] = $this->field( 'SMTP', $host . ( $port > 0 ? ':' . $port : '' ) );
                 $lines[] = $this->field( 'SMTP auth', ! empty( $transport['smtp_auth'] ) ? 'yes' : 'no' );
                 $lines[] = $this->field( 'SMTP secure', ! empty( $transport['smtp_secure'] ) ? $transport['smtp_secure'] : '-' );
-                $probe = isset( $email['transport_probe'] ) && is_array( $email['transport_probe'] ) ? $email['transport_probe'] : array();
-                $probeStatus = isset( $probe['status'] ) ? (string) $probe['status'] : 'not_run';
-                if ( empty( $probe['enabled'] ) ) {
-                    $probeStatus = 'not run';
-                } elseif ( 'ok' === $probeStatus ) {
-                    $probeStatus = 'passed';
-                } elseif ( 'failed' === $probeStatus ) {
-                    $probeStatus = 'failed';
-                } elseif ( 'unsupported' === $probeStatus ) {
-                    $probeStatus = 'unsupported';
-                } elseif ( 'not_applicable' === $probeStatus ) {
-                    $probeStatus = 'not applicable';
-                } else {
-                    $probeStatus = str_replace( '_', ' ', $probeStatus );
+                if ( 'TEST' !== $typeToken ) {
+                    $probe = isset( $email['transport_probe'] ) && is_array( $email['transport_probe'] ) ? $email['transport_probe'] : array();
+                    $probeStatus = isset( $probe['status'] ) ? (string) $probe['status'] : 'not_run';
+                    if ( empty( $probe['enabled'] ) ) {
+                        $probeStatus = 'not run';
+                    } elseif ( 'ok' === $probeStatus ) {
+                        $probeStatus = 'passed';
+                    } elseif ( 'failed' === $probeStatus ) {
+                        $probeStatus = 'failed';
+                    } elseif ( 'unsupported' === $probeStatus ) {
+                        $probeStatus = 'unsupported';
+                    } elseif ( 'not_applicable' === $probeStatus ) {
+                        $probeStatus = 'not applicable';
+                    } else {
+                        $probeStatus = str_replace( '_', ' ', $probeStatus );
+                    }
+                    $lines[] = $this->field( 'SMTP check', $probeStatus );
                 }
-                $lines[] = $this->field( 'SMTP check', $probeStatus );
             }
+        }
+        if ( 'TEST' === $typeToken ) {
+            $lines[] = $this->field( 'Test scope', 'WordPress mail pipeline' );
+            $lines[] = $this->field( 'Transport', 'not checked (use wp email-debug check)' );
         }
         $lines[] = $this->field( 'Attachments', isset( $email['attachments'] ) && is_array( $email['attachments'] ) ? count( $email['attachments'] ) : 0 );
         $lines[] = $this->field( 'Source', isset( $email['source']['label'] ) ? $email['source']['label'] : 'Other' );
@@ -130,22 +150,52 @@ final class EmailLogWriter {
             $lines[] = $this->field( 'Notice', 'Message body truncated by wp-email-debug size limit.' );
         }
 
+        if ( ! empty( $email['call_trace'] ) && is_array( $email['call_trace'] ) ) {
+            $traceLines = array_values( array_filter( array_map( 'strval', $email['call_trace'] ), 'strlen' ) );
+            if ( ! empty( $traceLines ) ) {
+                $lines[] = '';
+                $lines[] = 'CALL TRACE';
+                $lines[] = str_repeat( '-', 68 );
+                $lines[] = '';
+                $lines[] = array_shift( $traceLines );
+                if ( ! empty( $traceLines ) ) {
+                    $lines[] = 'Called by:';
+                    foreach ( $traceLines as $traceLine ) {
+                        $lines[] = '→ ' . $traceLine;
+                    }
+                }
+            }
+        }
+
         $issues = isset( $email['issues'] ) && is_array( $email['issues'] ) ? $email['issues'] : array();
-        if ( 'failed' === $status ) {
+        if ( 'failed' === $status && ! $this->hasErrorIssue( $issues ) ) {
             $error = isset( $email['error'] ) && is_array( $email['error'] ) ? $email['error'] : array();
             $failureMessage = isset( $error['message'] ) && '' !== trim( (string) $error['message'] )
                 ? (string) $error['message']
                 : 'WordPress reported an unknown wp_mail() failure.';
-            array_unshift(
-                $issues,
-                array(
-                    'level' => 'error',
-                    'code' => 'wp_mail_failed',
-                    'message' => 'WordPress/PHPMailer failed to send this email.',
-                    'detail' => 'Error: ' . $failureMessage,
-                    'result' => 'The email was not sent.',
-                )
-            );
+            if ( false !== stripos( $failureMessage, 'Could not instantiate mail function' ) ) {
+                array_unshift(
+                    $issues,
+                    array(
+                        'level' => 'error',
+                        'code' => 'php_mail_unavailable',
+                        'message' => 'PHP mail() transport could not be started.',
+                        'detail' => 'Error: ' . $failureMessage,
+                        'result' => 'The server/PHP mail configuration could not hand the email to a mail transport.',
+                    )
+                );
+            } else {
+                array_unshift(
+                    $issues,
+                    array(
+                        'level' => 'error',
+                        'code' => 'wp_mail_failed',
+                        'message' => 'WordPress/PHPMailer failed to send this email.',
+                        'detail' => 'Error: ' . $failureMessage,
+                        'result' => 'The email was not sent.',
+                    )
+                );
+            }
         }
 
         $lines[] = '';
@@ -155,7 +205,9 @@ final class EmailLogWriter {
 
         if ( empty( $issues ) ) {
             $probe = isset( $email['transport_probe'] ) && is_array( $email['transport_probe'] ) ? $email['transport_probe'] : array();
-            if ( ! empty( $probe['enabled'] ) && 'ok' === ( isset( $probe['status'] ) ? $probe['status'] : '' ) ) {
+            if ( 'TEST' === $typeToken ) {
+                $lines[] = '✓ WordPress mail pipeline reached PHPMailer and completed through the safe test transport.';
+            } elseif ( ! empty( $probe['enabled'] ) && 'ok' === ( isset( $probe['status'] ) ? $probe['status'] : '' ) ) {
                 $lines[] = '✓ No local configuration, message, or SMTP pre-delivery issues detected.';
             } else {
                 $lines[] = '✓ No local configuration or message issues detected.';
@@ -243,6 +295,15 @@ final class EmailLogWriter {
 
     private function field( $label, $value ) {
         return str_pad( $label . ':', 14, ' ', STR_PAD_RIGHT ) . $value;
+    }
+
+    private function hasErrorIssue( array $issues ) {
+        foreach ( $issues as $issue ) {
+            if ( is_array( $issue ) && isset( $issue['level'] ) && 'error' === (string) $issue['level'] ) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private function issueField( $label, $value ) {

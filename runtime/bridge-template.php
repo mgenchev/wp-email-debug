@@ -5,6 +5,50 @@ if ( ! defined( 'ABSPATH' ) ) {
     return;
 }
 
+/*
+ * A stale bridge can survive an interrupted listener session. Bail out before
+ * declaring any runtime functions unless the embedded session is still live.
+ * This keeps later WP-CLI commands such as `wp email-debug check` clean.
+ */
+$wpEmailDebugBootstrapSessionFile = '__WP_EMAIL_DEBUG_SESSION_FILE__';
+$wpEmailDebugBootstrapToken = '__WP_EMAIL_DEBUG_TOKEN__';
+$wpEmailDebugBootstrapActive = false;
+
+if ( is_file( $wpEmailDebugBootstrapSessionFile ) && ! is_link( $wpEmailDebugBootstrapSessionFile ) ) {
+    $wpEmailDebugBootstrapContents = @file_get_contents( $wpEmailDebugBootstrapSessionFile );
+    $wpEmailDebugBootstrapState = false !== $wpEmailDebugBootstrapContents
+        ? json_decode( $wpEmailDebugBootstrapContents, true )
+        : null;
+
+    if (
+        is_array( $wpEmailDebugBootstrapState )
+        && ! empty( $wpEmailDebugBootstrapState['token'] )
+        && hash_equals( $wpEmailDebugBootstrapToken, (string) $wpEmailDebugBootstrapState['token'] )
+        && ! empty( $wpEmailDebugBootstrapState['heartbeat'] )
+        && ( time() - (int) $wpEmailDebugBootstrapState['heartbeat'] ) <= 5
+        && ! empty( $wpEmailDebugBootstrapState['spool_directory'] )
+        && is_dir( $wpEmailDebugBootstrapState['spool_directory'] )
+        && ! is_link( $wpEmailDebugBootstrapState['spool_directory'] )
+    ) {
+        $wpEmailDebugBootstrapActive = true;
+    }
+}
+
+unset(
+    $wpEmailDebugBootstrapContents,
+    $wpEmailDebugBootstrapState
+);
+
+if ( ! $wpEmailDebugBootstrapActive ) {
+    return;
+}
+
+unset(
+    $wpEmailDebugBootstrapSessionFile,
+    $wpEmailDebugBootstrapToken,
+    $wpEmailDebugBootstrapActive
+);
+
 if ( ! function_exists( 'wp_email_debug_runtime_state' ) ) {
     function wp_email_debug_runtime_state() {
         $sessionFile = '__WP_EMAIL_DEBUG_SESSION_FILE__';
@@ -141,6 +185,79 @@ if ( ! function_exists( 'wp_email_debug_source_from_trace' ) ) {
             'file' => '',
             'line' => 0,
         );
+    }
+}
+
+if ( ! function_exists( 'wp_email_debug_call_trace' ) ) {
+    function wp_email_debug_call_trace() {
+        $trace = debug_backtrace( DEBUG_BACKTRACE_IGNORE_ARGS, 48 );
+        $abspath = trailingslashit( wp_normalize_path( ABSPATH ) );
+        $lines = array();
+        $seen = array();
+        $afterWpMail = false;
+        $skipFunctions = array(
+            'apply_filters',
+            'apply_filters_ref_array',
+            'do_action',
+            'do_action_ref_array',
+            'call_user_func',
+            'call_user_func_array',
+            'include',
+            'include_once',
+            'require',
+            'require_once',
+            '{closure}',
+        );
+
+        foreach ( $trace as $frame ) {
+            $function = isset( $frame['function'] ) ? (string) $frame['function'] : '';
+            $file = ! empty( $frame['file'] ) ? wp_normalize_path( $frame['file'] ) : '';
+
+            if ( ! $afterWpMail ) {
+                if ( 'wp_mail' !== $function ) {
+                    continue;
+                }
+
+                $afterWpMail = true;
+                if ( '' !== $file ) {
+                    $displayFile = 0 === strpos( $file, $abspath ) ? substr( $file, strlen( $abspath ) ) : $file;
+                    $line = isset( $frame['line'] ) ? (int) $frame['line'] : 0;
+                    $lines[] = 'Origin: ' . $displayFile . ( $line > 0 ? ':' . $line : '' );
+                }
+                continue;
+            }
+
+            if ( '' === $function || in_array( strtolower( $function ), $skipFunctions, true ) ) {
+                continue;
+            }
+
+            if ( 0 === strpos( $function, 'WP_CLI' ) ) {
+                continue;
+            }
+
+            $callable = '';
+            if ( ! empty( $frame['class'] ) ) {
+                $class = (string) $frame['class'];
+                if ( 0 === strpos( $class, 'WP_Hook' ) ) {
+                    continue;
+                }
+                $callable = $class . ( isset( $frame['type'] ) ? (string) $frame['type'] : '::' ) . $function . '()';
+            } else {
+                $callable = $function . '()';
+            }
+
+            if ( isset( $seen[ $callable ] ) ) {
+                continue;
+            }
+            $seen[ $callable ] = true;
+            $lines[] = $callable;
+
+            if ( count( $lines ) >= 4 ) {
+                break;
+            }
+        }
+
+        return $lines;
     }
 }
 
@@ -691,6 +808,47 @@ if ( ! function_exists( 'wp_email_debug_probe_transport' ) ) {
     }
 }
 
+if ( ! function_exists( 'wp_email_debug_format_bytes' ) ) {
+    function wp_email_debug_format_bytes( $bytes ) {
+        $bytes = max( 0, (int) $bytes );
+        if ( $bytes < 1024 ) {
+            return $bytes . ' B';
+        }
+        if ( $bytes < 1024 * 1024 ) {
+            return number_format( $bytes / 1024, 1 ) . ' KB';
+        }
+        return number_format( $bytes / ( 1024 * 1024 ), 1 ) . ' MB';
+    }
+}
+
+if ( ! function_exists( 'wp_email_debug_classify_smtp_failure' ) ) {
+    function wp_email_debug_classify_smtp_failure( $message ) {
+        $message = trim( (string) $message );
+        $lower = strtolower( $message );
+
+        if ( false !== strpos( $lower, 'getaddrinfo' ) || false !== strpos( $lower, 'php_network_getaddresses' ) || false !== strpos( $lower, 'name or service not known' ) || false !== strpos( $lower, 'could not resolve' ) || false !== strpos( $lower, 'host not found' ) ) {
+            return array( 'SMTP server hostname could not be resolved.', 'Check the SMTP hostname and DNS resolution on this server.' );
+        }
+        if ( false !== strpos( $lower, 'connection refused' ) ) {
+            return array( 'SMTP connection was refused.', 'Check the SMTP host, port, service availability and firewall rules.' );
+        }
+        if ( false !== strpos( $lower, 'timed out' ) || false !== strpos( $lower, 'timeout' ) ) {
+            return array( 'SMTP connection timed out.', 'The SMTP server could not be reached within the connection timeout. Check routing, firewall and host/port settings.' );
+        }
+        if ( false !== strpos( $lower, 'certificate' ) || false !== strpos( $lower, 'peer certificate' ) ) {
+            return array( 'SMTP TLS certificate validation failed.', 'Check the SMTP certificate, hostname and local CA configuration.' );
+        }
+        if ( false !== strpos( $lower, 'starttls' ) || false !== strpos( $lower, 'tls' ) || false !== strpos( $lower, 'ssl' ) || false !== strpos( $lower, 'crypto' ) ) {
+            return array( 'SMTP TLS negotiation failed.', 'Check the encryption mode, port and TLS support on the server.' );
+        }
+        if ( false !== strpos( $lower, 'authenticate' ) || false !== strpos( $lower, 'authentication' ) || false !== strpos( $lower, 'auth' ) ) {
+            return array( 'SMTP authentication failed.', 'Check the SMTP username, password/OAuth configuration and authentication method.' );
+        }
+
+        return array( 'SMTP connection or authentication failed.', 'The email would not reach the SMTP delivery stage with the current server settings or credentials.' );
+    }
+}
+
 if ( ! function_exists( 'wp_email_debug_probe_issues' ) ) {
     function wp_email_debug_probe_issues( array $probe ) {
         if ( empty( $probe['enabled'] ) || 'not_run' === $probe['status'] || 'not_applicable' === $probe['status'] || 'ok' === $probe['status'] ) {
@@ -718,13 +876,14 @@ if ( ! function_exists( 'wp_email_debug_probe_issues' ) ) {
         $detail = 'Details: ' . $message;
 
         if ( 'connect_auth' === $stage ) {
+            $classification = wp_email_debug_classify_smtp_failure( $message );
             return array(
                 wp_email_debug_validation_issue(
                     'error',
                     'transport_probe_failed',
-                    'SMTP connection or authentication failed.',
+                    $classification[0],
                     $detail,
-                    'The email would not reach the SMTP delivery stage with the current server settings or credentials.'
+                    $classification[1]
                 ),
             );
         }
@@ -979,6 +1138,64 @@ if ( ! function_exists( 'wp_email_debug_failed_attachment_metadata' ) ) {
     }
 }
 
+if ( ! function_exists( 'wp_email_debug_preempted_payload' ) ) {
+    function wp_email_debug_preempted_payload( $return, array $atts, array $state ) {
+        $headers = wp_email_debug_parse_failed_headers( isset( $atts['headers'] ) ? $atts['headers'] : array() );
+        $body = isset( $atts['message'] ) ? (string) $atts['message'] : '';
+        $maxBodyBytes = 5 * 1024 * 1024;
+        $truncated = strlen( $body ) > $maxBodyBytes;
+        if ( $truncated ) {
+            $body = substr( $body, 0, $maxBodyBytes );
+        }
+
+        $reportedFailure = false === $return;
+        $issues = wp_email_debug_validate_mail_args( $atts );
+        array_unshift(
+            $issues,
+            wp_email_debug_validation_issue(
+                $reportedFailure ? 'error' : 'warning',
+                'pre_wp_mail_short_circuit',
+                $reportedFailure ? 'A pre_wp_mail callback blocked the email.' : 'A pre_wp_mail callback bypassed PHPMailer.',
+                'Hook: pre_wp_mail',
+                $reportedFailure
+                    ? 'The callback returned false, so WordPress stopped the normal mail pipeline and reported failure.'
+                    : 'The callback reported success without running the normal WordPress/PHPMailer delivery path. Alternate delivery cannot be verified by wp-email-debug.'
+            )
+        );
+
+        return array(
+            'version' => 1,
+            'token' => (string) $state['token'],
+            'status' => $reportedFailure ? 'failed' : 'has_issues',
+            'captured_at' => microtime( true ),
+            'subject' => isset( $atts['subject'] ) ? (string) $atts['subject'] : '',
+            'from' => $headers['from'],
+            'to' => wp_email_debug_normalize_mail_list( isset( $atts['to'] ) ? $atts['to'] : array() ),
+            'cc' => $headers['cc'],
+            'bcc' => $headers['bcc'],
+            'reply_to' => $headers['reply_to'],
+            'content_type' => '-' !== $headers['content_type'] ? $headers['content_type'] : 'text/plain',
+            'charset' => $headers['charset'],
+            'body_b64' => base64_encode( $body ),
+            'alt_body_b64' => '',
+            'body_bytes' => isset( $atts['message'] ) ? strlen( (string) $atts['message'] ) : 0,
+            'truncated' => $truncated,
+            'attachments' => wp_email_debug_failed_attachment_metadata( isset( $atts['attachments'] ) ? $atts['attachments'] : array() ),
+            'original_headers' => $headers['raw'],
+            'transport' => array(),
+            'transport_probe' => array( 'enabled' => false, 'status' => 'not_run' ),
+            'issues' => $issues,
+            'error' => $reportedFailure ? array(
+                'code' => 'pre_wp_mail_short_circuit',
+                'message' => 'pre_wp_mail returned false and stopped wp_mail().',
+            ) : array(),
+            'source' => wp_email_debug_source_from_trace(),
+            'request' => wp_email_debug_request_context(),
+            'call_trace' => wp_email_debug_call_trace(),
+        );
+    }
+}
+
 if ( ! function_exists( 'wp_email_debug_failed_payload' ) ) {
     function wp_email_debug_failed_payload( $error, array $state ) {
         global $phpmailer;
@@ -1118,6 +1335,20 @@ if ( ! trait_exists( 'WP_Email_Debug_Capture_SMTP_Trait', false ) ) {
 
             $payload = $this->wpEmailDebugPayload;
             $payload['raw_mime_bytes'] = strlen( (string) $msg_data );
+            if ( $payload['raw_mime_bytes'] > 10 * 1024 * 1024 ) {
+                $issues = isset( $payload['issues'] ) && is_array( $payload['issues'] ) ? $payload['issues'] : array();
+                $issues[] = wp_email_debug_validation_issue(
+                    'warning',
+                    'message_large',
+                    'Email is unusually large.',
+                    'Size: ' . wp_email_debug_format_bytes( $payload['raw_mime_bytes'] ),
+                    'Large messages may be rejected by the SMTP or recipient server. The exact limit depends on the provider.'
+                );
+                $payload['issues'] = $issues;
+                if ( 'failed' !== ( isset( $payload['status'] ) ? $payload['status'] : 'successful' ) ) {
+                    $payload['status'] = 'has_issues';
+                }
+            }
             $written = $this->wpEmailDebugWriteSpool( $payload );
             if ( $written ) {
                 $this->wpEmailDebugCaptured = true;
@@ -1177,11 +1408,33 @@ if ( ! function_exists( 'wp_email_debug_ensure_capture_smtp' ) ) {
 }
 
 add_filter(
+    'pre_wp_mail',
+    function ( $return, $atts ) {
+        $state = wp_email_debug_runtime_state();
+        if ( ! is_array( $state ) || null === $return || ! is_array( $atts ) ) {
+            return $return;
+        }
+
+        $payload = wp_email_debug_preempted_payload( $return, $atts, $state );
+        wp_email_debug_write_spool( $state, $payload );
+        return $return;
+    },
+    PHP_INT_MAX,
+    2
+);
+
+add_filter(
     'wp_mail',
     function ( $args ) {
         $state = wp_email_debug_runtime_state();
         if ( is_array( $state ) && is_array( $args ) ) {
-            wp_email_debug_mail_args_registry( 'push', $args );
+            wp_email_debug_mail_args_registry(
+                'push',
+                array(
+                    'args' => $args,
+                    'call_trace' => wp_email_debug_call_trace(),
+                )
+            );
         }
         return $args;
     },
@@ -1196,16 +1449,20 @@ add_action(
             return;
         }
 
-        $mailArgs = wp_email_debug_mail_args_registry( 'pop' );
+        $mailEntry = wp_email_debug_mail_args_registry( 'pop' );
+        $mailArgs = isset( $mailEntry['args'] ) && is_array( $mailEntry['args'] ) ? $mailEntry['args'] : array();
         $transportProbe = wp_email_debug_probe_transport( $phpmailer, $state );
         $payload = wp_email_debug_build_payload( $phpmailer, $state );
+        $payload['call_trace'] = isset( $mailEntry['call_trace'] ) && is_array( $mailEntry['call_trace'] ) ? $mailEntry['call_trace'] : array();
         $payload['original_headers'] = wp_email_debug_parse_failed_headers( isset( $mailArgs['headers'] ) ? $mailArgs['headers'] : array() )['raw'];
         $payload['transport'] = wp_email_debug_transport_snapshot( $phpmailer );
         $payload['transport_probe'] = $transportProbe;
+        $transportIssues = ! empty( $state['pipeline_test'] ) ? array() : wp_email_debug_transport_issues( $payload['transport'] );
+        $probeIssues = ! empty( $state['pipeline_test'] ) ? array() : wp_email_debug_probe_issues( $transportProbe );
         $payload['issues'] = array_merge(
             wp_email_debug_validate_mail_args( is_array( $mailArgs ) ? $mailArgs : array() ),
-            wp_email_debug_transport_issues( $payload['transport'] ),
-            wp_email_debug_probe_issues( $transportProbe )
+            $transportIssues,
+            $probeIssues
         );
         foreach ( $payload['issues'] as $issue ) {
             if ( is_array( $issue ) && isset( $issue['level'] ) && ( 'warning' === $issue['level'] || 'error' === $issue['level'] ) ) {
@@ -1248,14 +1505,16 @@ add_action(
         }
 
         global $phpmailer;
-        $pendingArgs = wp_email_debug_mail_args_registry( 'pop' );
-        if ( ! empty( $pendingArgs ) && is_object( $phpmailer ) ) {
+        $pendingEntry = wp_email_debug_mail_args_registry( 'pop' );
+        $pendingArgs = isset( $pendingEntry['args'] ) && is_array( $pendingEntry['args'] ) ? $pendingEntry['args'] : array();
+        if ( ! empty( $pendingEntry ) && is_object( $phpmailer ) ) {
             wp_email_debug_payload_registry( 'clear', $phpmailer );
         }
 
         $payload = wp_email_debug_failed_payload( $error, $state );
+        $payload['call_trace'] = isset( $pendingEntry['call_trace'] ) && is_array( $pendingEntry['call_trace'] ) ? $pendingEntry['call_trace'] : array();
         if ( empty( $payload['issues'] ) ) {
-            $payload['issues'] = wp_email_debug_validate_mail_args( is_array( $pendingArgs ) ? $pendingArgs : array() );
+            $payload['issues'] = wp_email_debug_validate_mail_args( $pendingArgs );
         }
         wp_email_debug_write_spool( $state, $payload );
         if ( is_object( $phpmailer ) ) {

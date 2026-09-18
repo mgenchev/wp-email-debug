@@ -90,6 +90,7 @@ final class SessionManager {
             'heartbeat' => time(),
             'spool_directory' => $this->spoolDirectory,
             'probe_transport' => ! empty( $this->options['probe_transport'] ),
+            'pipeline_test' => ! empty( $this->options['pipeline_test'] ),
         );
 
         $json = json_encode( $payload, JSON_UNESCAPED_SLASHES );

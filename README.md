@@ -22,11 +22,31 @@ wp package install https://github.com/<owner>/<repository>.git
 
 ## Usage
 
+Listen for outgoing application email and block external delivery:
+
 ```bash
 wp email-debug
 ```
 
-Optional live SMTP transport probe:
+Run a one-shot configuration / SMTP pre-delivery check without sending SMTP `DATA`:
+
+```bash
+wp email-debug check
+```
+
+Run one controlled WordPress mail-pipeline test without external delivery:
+
+```bash
+wp email-debug test
+```
+
+The test recipient is the fixed safe address `wp-email-debug@example.com`. The subject/body are also fixed, so the command stays one-step and repeatable. External delivery is blocked by the temporary test transport. Test logs are clearly prefixed, for example:
+
+```text
+2026-09-18_10-45-00_TEST-SUCCESSFUL_wp-email-debug-pipeline-test.log
+```
+
+Optional live SMTP transport probe while the long-running listener is active:
 
 ```bash
 wp email-debug --probe-transport
@@ -63,11 +83,20 @@ Status semantics:
 
 - `Successful`: the intercepted WordPress/PHPMailer send pipeline completed without a detected local or enabled SMTP pre-delivery issue. External delivery is still blocked by the debugger.
 - `Has Issues`: the pipeline completed, but one or more detected problems could prevent real delivery or cause WordPress to send an incomplete/different message.
-- `Failed`: WordPress/PHPMailer reported that the send failed.
+- `Failed`: the normal WordPress mail pipeline was explicitly blocked or WordPress/PHPMailer reported that the send failed.
 
 Failed `wp_mail()` attempts are captured through WordPress' `wp_mail_failed` action. Failed entries use the `Failed` main status and receive a timestamped `FAILED` log containing the WordPress/PHPMailer error plus the available message/request context.
 
 On shutdown the listener prints a compact session summary with `Successful`, `Has Issues`, and `Failed` counts.
+
+
+## Quick mail check and test
+
+`wp email-debug test` answers a different question from the transport check: can the WordPress mail pipeline itself complete, or is plugin/theme/custom code blocking, short-circuiting, rerouting, or throwing before PHPMailer completes? It runs a real `wp_mail()` call through a temporary safe capture transport, so it does not depend on PHP `mail()`, Sendmail, or SMTP connectivity and does not deliver the test message externally.
+
+The test watches the mail-related WordPress hooks that exist before the temporary bridge is installed. When possible it identifies the exact callback/source responsible for a blocking `pre_wp_mail` short-circuit, a mail-hook exception, or a `wp_mail` recipient rewrite. A custom replacement for the core `wp_mail()` implementation is also reported when the normal WordPress/PHPMailer path cannot be verified.
+
+`wp email-debug check` is the transport/configuration companion. It inspects the configured mail path and, for SMTP, performs a real connect/TLS/auth/`MAIL FROM`/`RCPT TO` probe without sending `DATA`. This is where PHP `mail()`, Sendmail, SMTP host/port/auth/TLS, and server connectivity problems belong. Its logs use the `CHECK-*` prefix.
 
 ## Safety model
 
@@ -105,7 +134,12 @@ It can detect, where applicable:
 - unavailable or disabled PHP `mail()`;
 - broken `sendmail_path` or Sendmail/Qmail executable;
 - unsupported or unknown PHPMailer transport;
-- WordPress/PHPMailer failures reported through `wp_mail_failed`.
+- WordPress/PHPMailer failures reported through `wp_mail_failed`;
+- `pre_wp_mail` short-circuits that prevent PHPMailer from running;
+- controlled-test mail-hook exceptions with callback/source attribution where available;
+- controlled-test recipient rewrites caused by `wp_mail` filters;
+- possible duplicate emails with the same recipient, subject, and body within three seconds;
+- unusually large final MIME messages over 10 MB.
 
 The log explains each detected problem in practical terms. For example:
 
@@ -170,9 +204,9 @@ For PHP `mail()`, Sendmail, or custom transports, the package performs local con
 
 ## What is intercepted
 
-The package captures email that reaches the WordPress `wp_mail()` / PHPMailer delivery pipeline.
+The package captures email that reaches the WordPress `wp_mail()` / PHPMailer delivery pipeline. A `pre_wp_mail` short-circuit is also recorded as a failed event even though PHPMailer never runs, because that condition can suppress normal WordPress email delivery.
 
-It cannot universally intercept a plugin that sends email directly through an external provider API such as Mailgun, Amazon SES, or SendGrid without using `wp_mail()` / PHPMailer. If `pre_wp_mail` filters are detected, the CLI prints a warning because such a filter may implement an alternate delivery path.
+It cannot universally intercept a plugin that sends email directly through an external provider API such as Mailgun, Amazon SES, or SendGrid without using `wp_mail()` / PHPMailer. Such alternate delivery paths remain outside the package boundary.
 
 ## Logs
 
@@ -202,7 +236,30 @@ A log can contain:
 - alternative body when present;
 - attachment names, MIME types, and sizes;
 - best-effort source classification and source file;
+- compact call trace captured at the `wp_mail()` call site, showing the origin and only meaningful application callers;
 - failure code/message and PHPMailer exception code when `wp_mail()` fails.
+
+
+Call traces intentionally omit WordPress/bootstrap noise such as `include()`, `require()`, `require_once()`, filter dispatch, and `WP_Hook` frames. A direct top-level call can therefore be as small as:
+
+```text
+CALL TRACE
+--------------------------------------------------------------------
+
+Origin: wp-content/themes/mytheme/functions.php:166
+```
+
+When there are useful application callers:
+
+```text
+CALL TRACE
+--------------------------------------------------------------------
+
+Origin: wp-content/plugins/example/includes/class-mailer.php:84
+Called by:
+→ Example_Notifications->send()
+→ WC_Email->send()
+```
 
 SMTP passwords are never written to the log.
 

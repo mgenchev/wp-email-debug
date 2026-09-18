@@ -135,11 +135,12 @@ final class Console {
         $this->line();
     }
 
-    public function summary( $total, $failed, $hasIssues, $logDirectory ) {
+    public function summary( $total, $failed, $hasIssues, $logDirectory, $duplicates = 0 ) {
         $total = max( 0, (int) $total );
         $failed = max( 0, (int) $failed );
         $hasIssues = max( 0, (int) $hasIssues );
         $successful = max( 0, $total - $failed - $hasIssues );
+        $duplicates = max( 0, (int) $duplicates );
 
         $this->line( 'Email Debug stopped.' );
         $this->line();
@@ -147,6 +148,9 @@ final class Console {
         $this->line( 'Successful:    ' . $successful );
         $this->line( 'Has Issues:    ' . $hasIssues );
         $this->line( 'Failed:        ' . $failed );
+        if ( $duplicates > 0 ) {
+            $this->line( 'Duplicates:    ' . $duplicates );
+        }
         $this->line( 'Logs:          ' . $logDirectory );
         $this->line( 'Mail delivery: restored' );
     }

@@ -225,6 +225,15 @@ assert_true( ! empty( $probeState['probe_transport'] ), 'Transport probing is pe
 $probeSession->stop();
 remove_tree( $probeSessionRoot );
 
+$pipelineSessionRoot = temp_dir( 'wp-email-debug-pipeline-session' );
+$pipelineSession = new SessionManager( $pipelineSessionRoot . '/state', 'site-a', array( 'pipeline_test' => true ) );
+$pipelineSession->start();
+$pipelineState = json_decode( file_get_contents( $pipelineSession->getSessionFile() ), true );
+assert_true( ! empty( $pipelineState['pipeline_test'] ), 'Controlled test mode is persisted separately from transport probing.' );
+assert_true( empty( $pipelineState['probe_transport'] ), 'Controlled test mode does not enable the live transport probe.' );
+$pipelineSession->stop();
+remove_tree( $pipelineSessionRoot );
+
 // Stale session is safely replaced and stale spool is cleared.
 $staleRoot = temp_dir( 'wp-email-debug-stale' );
 $staleDir = $staleRoot . '/state';
@@ -262,6 +271,9 @@ assert_true( false !== strpos( $rendered, 'abc123' ), 'Generated bridge embeds t
 assert_true( false === strpos( $rendered, '__WP_EMAIL_DEBUG_TOKEN__' ), 'Generated bridge replaces token placeholders.' );
 $bridge->uninstall();
 assert_true( ! file_exists( $bridgePath ), 'Generated bridge is removed on uninstall.' );
+file_put_contents( $bridgePath, '<?php /* WP_EMAIL_DEBUG_RUNTIME_V1 */' );
+assert_true( BridgeInstaller::removeManagedBridge( $bridgePath ), 'BridgeInstaller can remove a stale managed runtime before a clean WP-CLI relaunch.' );
+assert_true( ! file_exists( $bridgePath ), 'Stale managed runtime file is removed.' );
 remove_tree( $bridgeRoot );
 
 // Spool reader accepts only the active token and consumes files.
@@ -544,6 +556,77 @@ foreach ( glob( $runtimeStateDir . '/spool/*.json' ) as $capturedFile ) {
     @unlink( $capturedFile );
 }
 
+
+// Runtime records pre_wp_mail short-circuits before PHPMailer instead of silently losing blocked messages.
+$preemptRuntimeTest = $runtimeRoot . '/preempt-runtime.php';
+file_put_contents( $preemptRuntimeTest, <<<'PHPTEST'
+<?php
+namespace PHPMailer\PHPMailer { class SMTP {} }
+namespace {
+    define( 'ABSPATH', '/srv/www/' ); define( 'WP_CONTENT_DIR', '/srv/www/wp-content' ); define( 'WP_PLUGIN_DIR', '/srv/www/wp-content/plugins' ); define( 'WPMU_PLUGIN_DIR', '/srv/www/wp-content/mu-plugins' );
+    $_SERVER['REQUEST_METHOD']='GET'; $_SERVER['REQUEST_URI']='/blocked-mail/'; $GLOBALS['hooks']=array();
+    function add_action($hook,$callback,$priority=10,$accepted=1){$GLOBALS['hooks'][$hook]=$callback;} function add_filter($hook,$callback,$priority=10,$accepted=1){$GLOBALS['hooks'][$hook]=$callback;}
+    function wp_normalize_path($path){return str_replace('\\','/',$path);} function trailingslashit($path){return rtrim($path,'/\\').'/';} function get_theme_root(){return '/srv/www/wp-content/themes';} function home_url($path=''){return 'https://example.test'.$path;}
+PHPTEST
+    . "require {$runtimeBridgeLiteral};\n"
+    . <<<'PHPTEST'
+    $atts=array('to'=>array('blocked@example.test'),'subject'=>'Blocked Mail','message'=>'blocked','headers'=>array(),'attachments'=>array(),'embeds'=>array());
+    $result=call_user_func($GLOBALS['hooks']['pre_wp_mail'],true,$atts); if(true!==$result){exit(70);}
+    $result=call_user_func($GLOBALS['hooks']['pre_wp_mail'],false,$atts); if(false!==$result){exit(71);}
+PHPTEST
+    . "    \$files = glob( {$runtimeSpoolLiteral} . '/*.json' );\n"
+    . <<<'PHPTEST'
+    if(2!==count($files)){exit(72);} sort($files,SORT_STRING); $first=json_decode(file_get_contents($files[0]),true); $second=json_decode(file_get_contents($files[1]),true);
+    $statuses=array($first['status'],$second['status']); sort($statuses,SORT_STRING); if(array('failed','has_issues')!==$statuses){exit(73);}
+    $failed='failed'===$first['status']?$first:$second; if('pre_wp_mail_short_circuit'!==$failed['error']['code']){exit(74);} exit(0);
+}
+PHPTEST
+);
+$preemptOutput=array(); $preemptStatus=0;
+exec(escapeshellarg(PHP_BINARY).' '.escapeshellarg($preemptRuntimeTest).' 2>&1',$preemptOutput,$preemptStatus);
+assert_same(0,$preemptStatus,'pre_wp_mail short-circuits are recorded as Failed events before PHPMailer. '.implode(' | ',$preemptOutput));
+foreach ( glob( $runtimeStateDir . '/spool/*.json' ) as $capturedFile ) { @unlink( $capturedFile ); }
+
+// Controlled pipeline-test sessions ignore transport configuration issues; transport belongs to `check`.
+$pipelineStateData = json_decode( file_get_contents( $runtimeSessionFile ), true );
+$pipelineStateData['pipeline_test'] = true;
+$pipelineStateData['probe_transport'] = false;
+$pipelineStateData['heartbeat'] = time();
+file_put_contents( $runtimeSessionFile, json_encode( $pipelineStateData ) );
+$pipelineRuntimeTest = $runtimeRoot . '/pipeline-runtime.php';
+file_put_contents( $pipelineRuntimeTest, <<<'PHPTEST'
+<?php
+namespace PHPMailer\PHPMailer { class SMTP {} }
+namespace {
+    define('ABSPATH','/srv/www/'); define('WP_CONTENT_DIR','/srv/www/wp-content'); define('WP_PLUGIN_DIR','/srv/www/wp-content/plugins'); define('WPMU_PLUGIN_DIR','/srv/www/wp-content/mu-plugins');
+    $_SERVER['REQUEST_METHOD']='CLI'; $_SERVER['REQUEST_URI']=''; $GLOBALS['hooks']=array();
+    function add_action($hook,$callback,$priority=10,$accepted=1){$GLOBALS['hooks'][$hook]=$callback;} function add_filter($hook,$callback,$priority=10,$accepted=1){$GLOBALS['hooks'][$hook]=$callback;}
+    function wp_normalize_path($path){return str_replace('\\','/',$path);} function trailingslashit($path){return rtrim($path,'/\\').'/';} function get_theme_root(){return '/srv/www/wp-content/themes';} function home_url($path=''){return 'https://example.test'.$path;}
+    class FakeMailer {
+        public $Body='x'; public $AltBody=''; public $From='wordpress@example.test'; public $FromName='WordPress'; public $Subject='Pipeline Test'; public $ContentType='text/plain'; public $CharSet='UTF-8';
+        public $Mailer='smtp'; public $Host=''; public $Port=0; public $SMTPAuth=true; public $Username=''; public $Password=''; public $SMTPSecure='tls'; public $SMTPAutoTLS=true; public $SMTPKeepAlive=false; public $Sender=''; public $Sendmail=''; public $SMTPDebug=0; public $smtp;
+        public function getToAddresses(){return array(array('wp-email-debug@example.com',''));} public function getCcAddresses(){return array();} public function getBccAddresses(){return array();} public function getReplyToAddresses(){return array();} public function getAttachments(){return array();}
+        public function isSMTP(){} public function setSMTPInstance($smtp){$this->smtp=$smtp;}
+    }
+PHPTEST
+    . "require {$runtimeBridgeLiteral};\n"
+    . <<<'PHPTEST'
+    call_user_func($GLOBALS['hooks']['wp_mail'],array('to'=>array('wp-email-debug@example.com'),'subject'=>'Pipeline Test','message'=>'x','headers'=>array(),'attachments'=>array(),'embeds'=>array()));
+    $mailer=new FakeMailer(); call_user_func($GLOBALS['hooks']['phpmailer_init'],$mailer); if(!$mailer->smtp->data('mime')){exit(80);}
+PHPTEST
+    . "    \$files = glob( {$runtimeSpoolLiteral} . '/*.json' );\n"
+    . <<<'PHPTEST'
+    if(1!==count($files)){exit(81);} $payload=json_decode(file_get_contents($files[0]),true); if('successful'!==$payload['status']){fwrite(STDERR,json_encode($payload['issues']));exit(82);} exit(0);
+}
+PHPTEST
+);
+$pipelineRuntimeOutput=array(); $pipelineRuntimeStatus=0;
+exec(escapeshellarg(PHP_BINARY).' '.escapeshellarg($pipelineRuntimeTest).' 2>&1',$pipelineRuntimeOutput,$pipelineRuntimeStatus);
+assert_same(0,$pipelineRuntimeStatus,'Controlled test mode ignores SMTP/PHP transport configuration issues and validates only the WordPress mail pipeline. '.implode(' | ',$pipelineRuntimeOutput));
+foreach ( glob( $runtimeStateDir . '/spool/*.json' ) as $capturedFile ) { @unlink( $capturedFile ); }
+$pipelineStateData['pipeline_test'] = false;
+$pipelineStateData['heartbeat'] = time();
+file_put_contents( $runtimeSessionFile, json_encode( $pipelineStateData ) );
 
 // WordPress silently ignores attachment exceptions; preflight must still flag them.
 $attachmentRuntimeTest = $runtimeRoot . '/attachment-runtime.php';
@@ -982,9 +1065,12 @@ namespace {
 PHPTEST
     . "require {$runtimeBridgeLiteral};\n"
     . <<<'PHPTEST'
-    $mailer = new FakeMailer();
-    call_user_func( $GLOBALS['hooks']['phpmailer_init'], $mailer );
-    exit( null === $mailer->smtp ? 0 : 11 );
+    if ( isset( $GLOBALS['hooks']['phpmailer_init'] ) ) {
+        $mailer = new FakeMailer();
+        call_user_func( $GLOBALS['hooks']['phpmailer_init'], $mailer );
+        exit( null === $mailer->smtp ? 0 : 11 );
+    }
+    exit( 0 );
 }
 PHPTEST
 );
@@ -1048,6 +1134,229 @@ $probeFailedPath = $writer->write( $probeFailedEmail );
 $probeFailedContents = file_get_contents( $probeFailedPath );
 assert_true( false !== strpos( $probeFailedContents, 'SMTP check:   failed' ), 'SMTP logs state when the live transport check failed.' );
 assert_true( false !== strpos( $probeFailedContents, 'SMTP connection or authentication failed.' ), 'Failed live SMTP checks remain visible in ISSUES.' );
+
+
+// One-shot TEST/CHECK logs are clearly distinguishable from listener captures.
+$modeLogRoot = temp_dir( 'wp-email-debug-mode-logs' );
+$modeWriter = new EmailLogWriter( $modeLogRoot );
+$modeEmail = $cleanIssueEmail;
+$modeEmail['subject'] = '[WP Email Debug] Test Email';
+$modeEmail['log_type'] = 'test';
+$testModeLog = $modeWriter->write( $modeEmail );
+assert_true( false !== strpos( basename( $testModeLog ), '_TEST-SUCCESSFUL_wp-email-debug-test-email.log' ), 'Test-email logs use a clear TEST-SUCCESSFUL filename token.' );
+$testModeContents = file_get_contents( $testModeLog );
+assert_true( false !== strpos( $testModeContents, 'WP EMAIL DEBUG - TEST' ), 'Test-email logs use a dedicated TEST heading.' );
+assert_true( false !== strpos( $testModeContents, 'Test scope:   WordPress mail pipeline' ), 'Test logs explicitly state that they validate the WordPress mail pipeline.' );
+assert_true( false !== strpos( $testModeContents, 'Transport:    not checked (use wp email-debug check)' ), 'Test logs clearly separate pipeline validation from transport checks.' );
+$modeEmail['log_type'] = 'check';
+$modeEmail['status'] = 'has_issues';
+$modeEmail['subject'] = '[WP Email Debug] Mail Check';
+$modeEmail['issues'] = array(
+    array( 'level' => 'error', 'code' => 'transport_probe_failed', 'message' => 'SMTP connection was refused.', 'detail' => 'Details: Connection refused', 'result' => 'Check the SMTP host and port.' ),
+);
+$checkModeLog = $modeWriter->write( $modeEmail );
+assert_true( false !== strpos( basename( $checkModeLog ), '_CHECK-HAS-ISSUES_wp-email-debug-mail-check.log' ), 'Mail-check logs use a clear CHECK-HAS-ISSUES filename token.' );
+remove_tree( $modeLogRoot );
+
+// Compact call traces are rendered only when present.
+$traceLogRoot = temp_dir( 'wp-email-debug-trace-log' );
+$traceWriter = new EmailLogWriter( $traceLogRoot );
+$traceEmail = $cleanIssueEmail;
+$traceEmail['subject'] = 'Trace Test';
+$traceEmail['call_trace'] = array(
+    'Origin: wp-content/themes/mytheme/functions.php:57',
+    'WC_Email->send()',
+    'WC_Emails->send_transactional_email()',
+);
+$traceLog = $traceWriter->write( $traceEmail );
+$traceContents = file_get_contents( $traceLog );
+assert_true( false !== strpos( $traceContents, 'CALL TRACE' . PHP_EOL . str_repeat( '-', 68 ) ), 'Logs always support the compact CALL TRACE section.' );
+assert_true( false !== strpos( $traceContents, 'Origin: wp-content/themes/mytheme/functions.php:57' ), 'Call trace starts with a labeled wp_mail origin.' );
+assert_true( false !== strpos( $traceContents, 'Called by:' ), 'Call trace labels meaningful outer callers.' );
+assert_true( false !== strpos( $traceContents, '→ WC_Email->send()' ), 'Call trace renders outer callables compactly.' );
+assert_true( false === strpos( $traceContents, 'require_once()' ) && false === strpos( $traceContents, 'include()' ), 'Call trace does not render bootstrap include/require noise.' );
+remove_tree( $traceLogRoot );
+
+// Duplicate detection marks, but does not block, the second matching email.
+$duplicateRoot = temp_dir( 'wp-email-debug-duplicates' );
+$duplicateState = $duplicateRoot . '/state';
+$duplicateSession = new SessionManager( $duplicateState, 'duplicate-site' );
+$duplicateToken = $duplicateSession->start();
+$duplicatePayload = array(
+    'token' => $duplicateToken,
+    'status' => 'successful',
+    'captured_at' => 1760000200.0,
+    'subject' => 'Duplicate Test',
+    'from' => 'WordPress <wordpress@example.test>',
+    'to' => array( 'example@example.com' ),
+    'cc' => array(), 'bcc' => array(), 'reply_to' => array(),
+    'content_type' => 'text/plain', 'charset' => 'UTF-8',
+    'body_b64' => base64_encode( 'Same body' ), 'alt_body_b64' => '',
+    'attachments' => array(), 'issues' => array(),
+    'source' => array( 'label' => 'mytheme', 'file' => '/srv/www/wp-content/themes/mytheme/functions.php', 'line' => 10 ),
+    'request' => array( 'method' => 'GET', 'path' => '/', 'type' => 'frontend' ),
+);
+file_put_contents( $duplicateSession->getSpoolDirectory() . '/001.json', json_encode( $duplicatePayload ) );
+$duplicatePayload['captured_at'] = 1760000200.8;
+file_put_contents( $duplicateSession->getSpoolDirectory() . '/002.json', json_encode( $duplicatePayload ) );
+$duplicateReader = new SpoolReader( $duplicateSession->getSpoolDirectory(), $duplicateToken );
+$duplicateLogs = new EmailLogWriter( $duplicateRoot . '/logs' );
+$duplicateConsole = new Console( false );
+$duplicateListener = new WpEmailDebug\Listener( $duplicateConsole, $duplicateSession, $duplicateReader, $duplicateLogs );
+assert_same( 2, $duplicateListener->drain(), 'Duplicate detection still consumes both email captures.' );
+assert_same( 1, $duplicateListener->getDuplicateCount(), 'Second identical email inside the duplicate window is counted as a possible duplicate.' );
+assert_same( 1, $duplicateListener->getHasIssuesCount(), 'Possible duplicate changes only the second successful email to Has Issues.' );
+$duplicateIssueLogs = glob( $duplicateRoot . '/logs/*_HAS-ISSUES_*.log' );
+assert_same( 1, count( $duplicateIssueLogs ), 'Possible duplicate receives a HAS-ISSUES log rather than being blocked.' );
+assert_true( false !== strpos( file_get_contents( $duplicateIssueLogs[0] ), 'Possible duplicate email detected.' ), 'Duplicate log explains the detected duplicate.' );
+$duplicateSession->stop();
+remove_tree( $duplicateRoot );
+
+// Controlled test runner uses wp_mail but consumes the safe capture payload instead of the real transport.
+$testRunnerRoot = temp_dir( 'wp-email-debug-test-runner' );
+$testRunnerScript = $testRunnerRoot . '/runner.php';
+$testRunnerLogDir = $testRunnerRoot . '/logs';
+$testRunnerSpoolDir = $testRunnerRoot . '/spool';
+mkdir( $testRunnerSpoolDir, 0700, true );
+file_put_contents( $testRunnerScript, <<<'PHPTEST'
+<?php
+namespace {
+    final class WP_CLI {
+        public static function line( $message = '' ) {}
+        public static function warning( $message ) {}
+        public static function colorize( $message ) { return preg_replace( '/%[A-Za-z0-9_]/', '', $message ); }
+    }
+    function home_url( $path = '' ) { return 'https://example.test' . $path; }
+    function wp_date( $format, $timestamp = null ) { return gmdate( $format, null === $timestamp ? time() : $timestamp ); }
+    function wp_normalize_path( $path ) { return str_replace( '\\', '/', $path ); }
+    function wp_mail( $to, $subject, $message, $headers = array(), $attachments = array() ) {
+        $payload = array(
+            'version' => 1,
+            'token' => $GLOBALS['spool_token'],
+            'status' => 'successful',
+            'captured_at' => microtime( true ),
+            'subject' => $subject,
+            'from' => 'WordPress <wordpress@example.test>',
+            'to' => array( $to ),
+            'cc' => array(), 'bcc' => array(), 'reply_to' => array(),
+            'content_type' => 'text/plain', 'charset' => 'UTF-8',
+            'body_b64' => base64_encode( $message ), 'alt_body_b64' => '',
+            'attachments' => array(), 'issues' => array(), 'error' => array(),
+            'transport' => array( 'mailer' => 'mail', 'host' => '', 'port' => 0, 'smtp_auth' => false, 'smtp_secure' => '' ),
+            'transport_probe' => array( 'enabled' => false, 'status' => 'not_run' ),
+            'source' => array( 'type' => 'cli', 'label' => 'WP Email Debug', 'file' => '', 'line' => 0 ),
+            'request' => array( 'method' => 'CLI', 'path' => 'wp email-debug test', 'type' => 'cli' ),
+        );
+        file_put_contents( $GLOBALS['spool_dir'] . '/001.json', json_encode( $payload ) );
+        return true;
+    }
+}
+namespace WpEmailDebugTest {
+    require $argv[1] . '/src/Console.php';
+    require $argv[1] . '/src/EmailLogWriter.php';
+    require $argv[1] . '/src/SpoolReader.php';
+    require $argv[1] . '/src/MailHookInspector.php';
+    require $argv[1] . '/src/TestMailRunner.php';
+    $GLOBALS['spool_dir'] = $argv[3];
+    $GLOBALS['spool_token'] = 'test-token';
+    $runner = new \WpEmailDebug\TestMailRunner(
+        new \WpEmailDebug\Console( false ),
+        new \WpEmailDebug\EmailLogWriter( $argv[2] ),
+        new \WpEmailDebug\SpoolReader( $argv[3], 'test-token' ),
+        new \WpEmailDebug\MailHookInspector()
+    );
+    $payload = $runner->run();
+    if ( 'successful' !== $payload['status'] ) exit( 2 );
+    $files = glob( $argv[2] . '/*.log' );
+    if ( 1 !== count( $files ) ) exit( 3 );
+    if ( false === strpos( basename( $files[0] ), '_TEST-SUCCESSFUL_wp-email-debug-pipeline-test.log' ) ) exit( 4 );
+    $contents = file_get_contents( $files[0] );
+    if ( false === strpos( $contents, 'completed through the safe test transport' ) ) exit( 5 );
+    exit( 0 );
+}
+PHPTEST
+);
+$testRunnerOutput = array();
+$testRunnerStatus = 0;
+exec( escapeshellarg( PHP_BINARY ) . ' ' . escapeshellarg( $testRunnerScript ) . ' ' . escapeshellarg( $root ) . ' ' . escapeshellarg( $testRunnerLogDir ) . ' ' . escapeshellarg( $testRunnerSpoolDir ) . ' 2>&1', $testRunnerOutput, $testRunnerStatus );
+assert_same( 0, $testRunnerStatus, 'wp email-debug test uses the controlled capture path and writes a TEST-SUCCESSFUL log without real delivery. ' . implode( ' | ', $testRunnerOutput ) );
+remove_tree( $testRunnerRoot );
+
+// Test runner converts unexpected wp_mail() exceptions into FAILED logs instead of losing diagnostics.
+$testFailureRoot = temp_dir( 'wp-email-debug-test-failure' );
+$testFailureScript = $testFailureRoot . '/runner.php';
+$testFailureLogDir = $testFailureRoot . '/logs';
+$testFailureSpoolDir = $testFailureRoot . '/spool';
+mkdir( $testFailureSpoolDir, 0700, true );
+file_put_contents( $testFailureScript, <<<'PHPTEST'
+<?php
+namespace {
+    final class WP_CLI { public static function line($m=''){} public static function warning($m){} public static function colorize($m){return preg_replace('/%[A-Za-z0-9_]/','',$m);} }
+    function home_url($p=''){return 'https://example.test'.$p;} function wp_date($f,$t=null){return gmdate($f,null===$t?time():$t);} function wp_normalize_path($p){return str_replace('\\','/',$p);}
+    function wp_mail($to,$subject,$message,$headers=array(),$attachments=array()){ throw new \RuntimeException('Mailer bootstrap exploded'); }
+}
+namespace WpEmailDebugTestFailure {
+    require $argv[1].'/src/Console.php'; require $argv[1].'/src/EmailLogWriter.php'; require $argv[1].'/src/SpoolReader.php'; require $argv[1].'/src/MailHookInspector.php'; require $argv[1].'/src/TestMailRunner.php';
+    $runner=new \WpEmailDebug\TestMailRunner(new \WpEmailDebug\Console(false),new \WpEmailDebug\EmailLogWriter($argv[2]),new \WpEmailDebug\SpoolReader($argv[3],'test-token'),new \WpEmailDebug\MailHookInspector());
+    $payload=$runner->run(); if('failed'!==$payload['status']) exit(2); if(false===strpos($payload['error']['message'],'Mailer bootstrap exploded')) exit(3);
+    $files=glob($argv[2].'/*.log'); if(1!==count($files) || false===strpos(basename($files[0]),'_TEST-FAILED_')) exit(4); exit(0);
+}
+PHPTEST
+);
+$testFailureOutput=array(); $testFailureStatus=0;
+exec(escapeshellarg(PHP_BINARY).' '.escapeshellarg($testFailureScript).' '.escapeshellarg($root).' '.escapeshellarg($testFailureLogDir).' '.escapeshellarg($testFailureSpoolDir).' 2>&1',$testFailureOutput,$testFailureStatus);
+assert_same(0,$testFailureStatus,'Unexpected wp_mail exceptions become TEST-FAILED logs. '.implode(' | ',$testFailureOutput));
+remove_tree($testFailureRoot);
+
+// Hook inspector identifies exact pre_wp_mail blockers and recipient rerouting callbacks.
+$GLOBALS['wp_filter'] = array();
+$preHook = new stdClass();
+$blockingCallback = function ( $return, $atts ) { return false; };
+$preHook->callbacks = array(
+    10 => array(
+        'blocker' => array( 'function' => $blockingCallback, 'accepted_args' => 2 ),
+    ),
+);
+$GLOBALS['wp_filter']['pre_wp_mail'] = $preHook;
+$inspector = new WpEmailDebug\MailHookInspector();
+$inspector->install();
+$wrappedBlocker = $GLOBALS['wp_filter']['pre_wp_mail']->callbacks[10]['blocker']['function'];
+$wrappedBlocker( null, array( 'to' => 'wp-email-debug@example.com' ) );
+$blockerIssues = $inspector->issues( 'wp-email-debug@example.com' );
+assert_same( 'pre_wp_mail_short_circuit', $blockerIssues[0]['code'], 'Hook inspector identifies pre_wp_mail short-circuit callbacks as blocking issues.' );
+assert_true( false !== strpos( $blockerIssues[0]['detail'], 'Callback:' ), 'Blocking hook issue identifies the callback responsible.' );
+$inspector->restore();
+assert_true( $GLOBALS['wp_filter']['pre_wp_mail']->callbacks[10]['blocker']['function'] === $blockingCallback, 'Hook inspector restores the original callback after the test.' );
+
+$GLOBALS['wp_filter'] = array();
+$wpMailHook = new stdClass();
+$rerouteCallback = function ( $args ) { $args['to'] = 'sink@example.com'; return $args; };
+$wpMailHook->callbacks = array(
+    10 => array(
+        'reroute' => array( 'function' => $rerouteCallback, 'accepted_args' => 1 ),
+    ),
+);
+$GLOBALS['wp_filter']['wp_mail'] = $wpMailHook;
+$rerouteInspector = new WpEmailDebug\MailHookInspector();
+$rerouteInspector->install();
+$wrappedReroute = $GLOBALS['wp_filter']['wp_mail']->callbacks[10]['reroute']['function'];
+$wrappedReroute( array( 'to' => 'wp-email-debug@example.com', 'subject' => 'x', 'message' => 'x', 'headers' => array(), 'attachments' => array() ) );
+$rerouteIssues = $rerouteInspector->issues( 'wp-email-debug@example.com' );
+assert_same( 'wp_mail_recipient_changed', $rerouteIssues[0]['code'], 'Hook inspector flags plugins or theme code that reroute the test recipient.' );
+$rerouteInspector->restore();
+unset( $GLOBALS['wp_filter'] );
+
+// Listener runtime also records pre_wp_mail short-circuits instead of silently missing blocked email.
+$runtimeSource = file_get_contents( __DIR__ . '/../runtime/bridge-template.php' );
+assert_true( false !== strpos( $runtimeSource, "'pre_wp_mail_short_circuit'" ), 'Runtime records pre_wp_mail short-circuits as failed email events.' );
+assert_true( false !== strpos( $runtimeSource, "'pre_wp_mail'," ), 'Runtime installs a pre_wp_mail observer for blocked email.' );
+
+// New transport diagnostics include specific SMTP failure categories and MIME-size protection.
+$runtimeSource = file_get_contents( __DIR__ . '/../runtime/bridge-template.php' );
+assert_true( false !== strpos( $runtimeSource, 'SMTP connection was refused.' ), 'SMTP probe classifies connection-refused failures explicitly.' );
+assert_true( false !== strpos( $runtimeSource, 'SMTP authentication failed.' ), 'SMTP probe classifies authentication failures explicitly.' );
+assert_true( false !== strpos( $runtimeSource, 'SMTP TLS negotiation failed.' ), 'SMTP probe classifies TLS failures explicitly.' );
+assert_true( false !== strpos( $runtimeSource, "'message_large'" ), 'Capture transport adds an issue for unusually large final MIME messages.' );
 
 // Main message status vocabulary is intentionally limited to successful / has_issues / failed.
 $productionStatusSources = file_get_contents( __DIR__ . '/../runtime/bridge-template.php' )
